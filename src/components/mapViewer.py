@@ -8,6 +8,7 @@ Enhanced MapViewer — Continuous GPS tracking with path history
 import os
 import json
 import math
+import threading
 from math import radians, cos, sin, sqrt, atan2
 
 from PyQt6.QtCore import (
@@ -142,6 +143,9 @@ class MapViewer(QWidget):
     waypoint_data    = pyqtSignal(list)
     position_updated = pyqtSignal(float, float)
 
+    osm_download_progress = pyqtSignal(int, int, str)
+    osm_download_finished = pyqtSignal(bool, str, str, dict)
+
     # ------------------------------------------------------------------
     # Tile configuration
     # OSM street map: zoom=17, 5×5 tiles → ~1400m × 1400m coverage
@@ -174,6 +178,12 @@ class MapViewer(QWidget):
 
         self._map_downloaded      = False
         self._map_drift_threshold = 400  # re-download if rover drifts >400m
+
+        # Async OSM download state (never block the Qt UI thread)
+        self._osm_download_in_progress = False
+        self._osm_cancel_event: threading.Event | None = None
+        self._pending_osm_request = None
+        self._is_closing = False
 
         # ---- UI ----
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -249,7 +259,10 @@ class MapViewer(QWidget):
 
         self.main_layout.addLayout(btn_layout)
 
-        # Load map
+        self.osm_download_progress.connect(self._on_osm_download_progress)
+        self.osm_download_finished.connect(self._on_osm_download_finished)
+
+        # Load map (cached/placeholder immediately; online fetch in background)
         self._load_map_with_fallback()
         self._page_ready = True
 
@@ -282,16 +295,22 @@ class MapViewer(QWidget):
     # =========================================================================
 
     def _load_map_with_fallback(self):
-        print("[MAP] Trying online OSM street map...")
-        if self._load_online_map():
-            self._map_downloaded = True
-            return
-        print("[MAP] Online failed, trying offline cache...")
+        # Always render something immediately, then attempt online download asynchronously.
         if self._load_offline_map_image():
             self._map_downloaded = True
-            return
-        print("[MAP] No map available, showing placeholder.")
-        self._show_map_placeholder()
+        else:
+            self._show_map_placeholder()
+
+        if self.TILE_SOURCE == 'osm':
+            # Kick off background OSM download (won't freeze UI even if DNS/network stalls).
+            self._start_osm_download_async(
+                center_lat=self.mission_latitude,
+                center_lon=self.mission_longitude,
+                zoom=self.DEFAULT_ZOOM,
+                tiles_x=self.DEFAULT_TILES_X,
+                tiles_y=self.DEFAULT_TILES_Y,
+                reason="startup",
+            )
 
     def _load_online_map(self):
         try:
@@ -311,9 +330,94 @@ class MapViewer(QWidget):
         print(f"[MAP] {msg}")
         return ok
 
-    def _download_osm_map(self, center_lat, center_lon,
-                           zoom=17, tiles_x=5, tiles_y=5,
-                           progress_callback=None):
+    def _start_osm_download_async(self, center_lat, center_lon, zoom, tiles_x, tiles_y, reason=""):
+        if self._is_closing:
+            return
+        request = (float(center_lat), float(center_lon), int(zoom), int(tiles_x), int(tiles_y), str(reason))
+
+        # If one is already running, remember the latest request and return.
+        if self._osm_download_in_progress:
+            self._pending_osm_request = request
+            return
+
+        self._pending_osm_request = None
+        self._osm_download_in_progress = True
+        self._osm_cancel_event = threading.Event()
+
+        def _progress(done, total, message):
+            self.osm_download_progress.emit(int(done), int(total), str(message))
+
+        def _run():
+            # Entire download happens off the UI thread.
+            try:
+                import socket
+                try:
+                    socket.create_connection(("8.8.8.8", 53), timeout=2)
+                except Exception:
+                    self.osm_download_finished.emit(False, "No internet connection", "", {})
+                    return
+
+                ok, msg, save_path, bounds = self._download_osm_map_to_disk(
+                    center_lat=request[0],
+                    center_lon=request[1],
+                    zoom=request[2],
+                    tiles_x=request[3],
+                    tiles_y=request[4],
+                    progress_callback=_progress,
+                    cancel_event=self._osm_cancel_event,
+                )
+                self.osm_download_finished.emit(bool(ok), str(msg), str(save_path), dict(bounds) if bounds else {})
+            except Exception as e:
+                self.osm_download_finished.emit(False, f"Map download failed: {e}", "", {})
+
+        t = threading.Thread(target=_run, name="osm-map-download", daemon=True)
+        t.start()
+
+    def _on_osm_download_progress(self, done, total, message):
+        if self._is_closing:
+            return
+        # Don't spam the label if GPS is already connected.
+        if not self.gps_connected:
+            self.gps_status.setText(f"MAP: {message} ({done}/{total})")
+
+    def _on_osm_download_finished(self, ok, msg, save_path, bounds):
+        self._osm_download_in_progress = False
+        self._osm_cancel_event = None
+
+        if self._is_closing:
+            return
+
+        if ok and save_path and os.path.exists(save_path):
+            try:
+                pixmap = QPixmap(save_path)
+                if not pixmap.isNull():
+                    if bounds:
+                        self.map_bounds = bounds
+                    self.original_pixmap = pixmap.copy()
+                    self.map_display.setPixmap(
+                        self.original_pixmap.scaledToWidth(
+                            700, Qt.TransformationMode.SmoothTransformation
+                        )
+                    )
+                    self._map_downloaded = True
+                    self._draw_marker_on_map()
+            except Exception as e:
+                print(f"[MAP] Failed to apply downloaded map: {e}")
+
+        if not self.gps_connected:
+            self.gps_status.setText(f"MAP: {msg}")
+        print(f"[MAP] {msg}")
+
+        # If a newer request came in while downloading, run it next.
+        if self._pending_osm_request and not self._is_closing:
+            lat, lon, zoom, tx, ty, reason = self._pending_osm_request
+            self._pending_osm_request = None
+            self._start_osm_download_async(lat, lon, zoom, tx, ty, reason=reason)
+
+    def _download_osm_map_to_disk(self, center_lat, center_lon,
+                                 zoom=17, tiles_x=5, tiles_y=5,
+                                 progress_callback=None,
+                                 cancel_event: threading.Event | None = None):
         """
         Download OpenStreetMap street tiles and stitch into one image.
 
@@ -326,12 +430,12 @@ class MapViewer(QWidget):
         try:
             import requests
         except ImportError:
-            return False, "requests not installed — pip install requests"
+            return False, "requests not installed — pip install requests", "", {}
         try:
             from PIL import Image
             import io
         except ImportError:
-            return False, "Pillow not installed — pip install Pillow"
+            return False, "Pillow not installed — pip install Pillow", "", {}
 
         def _tile_col_row(lat, lon, z):
             """GPS → OSM tile column (x) and row (y)"""
@@ -378,6 +482,8 @@ class MapViewer(QWidget):
 
         for grid_row in range(tiles_y):
             for grid_col in range(tiles_x):
+                if cancel_event is not None and cancel_event.is_set():
+                    return False, "Cancelled", "", {}
                 col = max(0, min(center_col - half_x + grid_col, n_max))
                 row = max(0, min(center_row - half_y + grid_row, n_max))
                 cols_used.append(col)
@@ -391,7 +497,9 @@ class MapViewer(QWidget):
                 url = f"https://tile.openstreetmap.org/{zoom}/{col}/{row}.png"
 
                 try:
-                    resp = requests.get(url, headers=headers, timeout=10)
+                    # Use a tuple for connect/read timeouts. DNS resolution can still block,
+                    # which is why downloads run in a background thread.
+                    resp = requests.get(url, headers=headers, timeout=(3.0, 10.0))
                     if resp.status_code == 200:
                         tile_img = Image.open(io.BytesIO(resp.content))
                         stitched.paste(tile_img, (grid_col * tile_px, grid_row * tile_px))
@@ -412,7 +520,7 @@ class MapViewer(QWidget):
         north_lat, west_lon, _, _         = _tile_edge_bounds(col_min, row_min, zoom)
         _, _,       south_lat, east_lon   = _tile_edge_bounds(col_max, row_max, zoom)
 
-        self.map_bounds = {
+        bounds = {
             "min_lat": south_lat,   # bottom / south
             "max_lat": north_lat,   # top    / north
             "min_lon": west_lon,    # left   / west
@@ -437,22 +545,40 @@ class MapViewer(QWidget):
 
         stitched.save(save_path)
         with open(bounds_path, "w") as f:
-            json.dump(self.map_bounds, f, indent=2)
+            json.dump(bounds, f, indent=2)
         print(f"[MAP] Saved → {save_path}")
         print(f"[MAP] Bounds → {bounds_path}")
 
-        pixmap = QPixmap(save_path)
-        if not pixmap.isNull():
-            self.original_pixmap = pixmap.copy()
-            self.map_display.setPixmap(
-                self.original_pixmap.scaledToWidth(
-                    700, Qt.TransformationMode.SmoothTransformation))
-            self._draw_marker_on_map()
-            size_kb = os.path.getsize(save_path) // 1024
-            return True, (f"Downloaded {tiles_x}×{tiles_y} OSM tiles "
-                          f"at zoom {zoom} ({size_kb} KB, "
-                          f"{area_lat_m:.0f}m × {area_lon_m:.0f}m)")
-        return False, "Map saved but QPixmap failed to load it"
+        size_kb = os.path.getsize(save_path) // 1024
+        return True, (
+            f"Downloaded {tiles_x}×{tiles_y} OSM tiles at zoom {zoom} "
+            f"({size_kb} KB, {area_lat_m:.0f}m × {area_lon_m:.0f}m)"
+        ), save_path, bounds
+
+    def _download_osm_map(self, center_lat, center_lon,
+                           zoom=17, tiles_x=5, tiles_y=5,
+                           progress_callback=None):
+        ok, msg, save_path, bounds = self._download_osm_map_to_disk(
+            center_lat=center_lat,
+            center_lon=center_lon,
+            zoom=zoom,
+            tiles_x=tiles_x,
+            tiles_y=tiles_y,
+            progress_callback=progress_callback,
+            cancel_event=None,
+        )
+        if ok and save_path and os.path.exists(save_path):
+            pixmap = QPixmap(save_path)
+            if not pixmap.isNull():
+                self.map_bounds = bounds
+                self.original_pixmap = pixmap.copy()
+                self.map_display.setPixmap(
+                    self.original_pixmap.scaledToWidth(
+                        700, Qt.TransformationMode.SmoothTransformation))
+                self._draw_marker_on_map()
+                return True, msg
+            return False, "Map saved but QPixmap failed to load it"
+        return False, msg
 
     def _load_offline_map_image(self):
         candidates = [
@@ -522,13 +648,14 @@ class MapViewer(QWidget):
         lat = self.current_lat if self.gps_connected else self.mission_latitude
         lon = self.current_lon if self.gps_connected else self.mission_longitude
         print(f"[MAP] Refreshing around ({lat:.6f}, {lon:.6f})...")
-        ok, msg = self._download_osm_map(
-            lat, lon,
+        self._start_osm_download_async(
+            center_lat=lat,
+            center_lon=lon,
             zoom=self.DEFAULT_ZOOM,
             tiles_x=self.DEFAULT_TILES_X,
-            tiles_y=self.DEFAULT_TILES_Y
+            tiles_y=self.DEFAULT_TILES_Y,
+            reason="manual-refresh",
         )
-        print(f"[MAP] Refresh: {msg}")
 
     # =========================================================================
     # GPS → pixel  (single source of truth — Web Mercator)
@@ -653,8 +780,9 @@ class MapViewer(QWidget):
                 self.gps_path.pop(0)
 
         # Heading update: infer from motion (bearing between last two points)
+        # Only do this if we don't already have an external heading.
         try:
-            if prev_point is not None and prev_point != (lat, lon):
+            if self.rover_heading_deg is None and prev_point is not None and prev_point != (lat, lon):
                 prev_lat, prev_lon = prev_point
                 moved_m = self._haversine(prev_lat, prev_lon, lat, lon)
                 if moved_m >= 0.5:
@@ -685,13 +813,14 @@ class MapViewer(QWidget):
                 print(f"[MAP] Rover drifted {dist:.0f}m — re-downloading...")
                 self.mission_latitude  = lat
                 self.mission_longitude = lon
-                ok, msg = self._download_osm_map(
-                    lat, lon,
+                self._start_osm_download_async(
+                    center_lat=lat,
+                    center_lon=lon,
                     zoom=self.DEFAULT_ZOOM,
                     tiles_x=self.DEFAULT_TILES_X,
-                    tiles_y=self.DEFAULT_TILES_Y
+                    tiles_y=self.DEFAULT_TILES_Y,
+                    reason="gps-drift",
                 )
-                print(f"[MAP] {msg}")
 
         self.gps_status.setText(
             f"GPS ✓ | {lat:.6f}, {lon:.6f} | "
@@ -801,6 +930,15 @@ class MapViewer(QWidget):
 
     def is_at_destination(self, la1, lo1, la2, lo2, threshold=5):
         return self._haversine(la1, lo1, la2, lo2) <= threshold
+
+    def closeEvent(self, event):
+        self._is_closing = True
+        try:
+            if self._osm_cancel_event is not None:
+                self._osm_cancel_event.set()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # API compatibility stubs
     def _build_and_load_map(self): pass
