@@ -281,6 +281,15 @@ class DashboardUI:
         if self.viewer_panel:
             self.viewer_panel.update_status(data)
 
+        # Optional heading support (degrees, 0=north, 90=east)
+        try:
+            heading = data.get("heading_deg") if isinstance(data, dict) else None
+            if heading is not None and self.map_viewer:
+                self.map_viewer.rover_heading_deg = float(heading)
+                self.map_viewer._draw_marker_on_map()
+        except Exception as e:
+            print(f"[Dashboard] Heading update failed: {e}")
+
     def on_gps_received(self, lat, lon):
 
         if self.map_viewer:
